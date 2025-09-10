@@ -2,87 +2,104 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import json
+from collections import deque
 
-# Initialize MediaPipe Hand module
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+class HandDrawingApp:
+    def __init__(self):
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
 
-# Setup video capture
-cap = cv2.VideoCapture(0)
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+        self.cap = cv2.VideoCapture(0)
+        
+        self.drawing = False
+        self.drawn_points = []
+        self.smooth_buffer = deque(maxlen=5)  
+        self.brush_color = (255, 0, 0)  
+        self.brush_size = 3
 
-# Variables to store drawing state and data
-drawing = False
-drawn_points = []
+    def calculate_distance(self, p1, p2):
+        return np.linalg.norm(np.array(p1) - np.array(p2))
 
-# Function to calculate distance between two points
-def calculate_distance(p1, p2):
-    return np.linalg.norm(np.array(p1) - np.array(p2))
+    def clear_canvas(self):
+        self.drawn_points = []
 
-# Function to clear the canvas
-def clear_canvas():
-    global drawn_points
-    drawn_points = []  # Reset the list of drawn points
+    def save_canvas(self, frame):
+        cv2.imwrite("drawing_output.png", frame)
+        with open("drawing_data.json", "w") as f:
+            json.dump(self.drawn_points, f)
+        print("Drawing saved as image and JSON")
 
-# Main loop
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+    def run(self):
+        while self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                break
 
-    # Flip the frame horizontally for a later selfie-view display
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = self.hands.process(rgb_frame)
 
-    # Convert the BGR image to RGB
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if result.multi_hand_landmarks:
+                for hand_landmarks in result.multi_hand_landmarks:
+                    thumb_tip = (
+                        hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP].x * w,
+                        hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP].y * h
+                    )
+                    index_tip = (
+                        hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP].x * w,
+                        hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP].y * h
+                    )
 
-    # Process the frame with MediaPipe Hands
-    result = hands.process(rgb_frame)
+                    distance = self.calculate_distance(thumb_tip, index_tip)
 
-    if result.multi_hand_landmarks:
-        for hand_landmarks in result.multi_hand_landmarks:
-            # Get coordinates of thumb_tip and index_finger_tip
-            thumb_tip = (hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].x * w,
-                         hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].y * h)
-            index_finger_tip = (hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * w,
-                                hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * h)
+                    self.drawing = distance < 35
 
-            # Calculate distance
-            distance = calculate_distance(thumb_tip, index_finger_tip)
+                    if self.drawing:
+                        self.smooth_buffer.append(index_tip)
+                        avg_x = int(np.mean([p[0] for p in self.smooth_buffer]))
+                        avg_y = int(np.mean([p[1] for p in self.smooth_buffer]))
+                        point = (avg_x, avg_y)
+                        self.drawn_points.append(point)
+                        cv2.circle(frame, point, 5, (0, 255, 0), -1)
 
-            # Check if the distance is less than a certain value to start drawing
-            if distance < 35:
-                drawing = True
-            else:
-                drawing = False
+                    self.mp_drawing.draw_landmarks(
+                        frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
+                    )
 
-            if drawing:
-                cv2.circle(frame, (int(index_finger_tip[0]), int(index_finger_tip[1])), 5, (0, 255, 0), -1)
-                drawn_points.append((int(index_finger_tip[0]), int(index_finger_tip[1])))
+            for i in range(1, len(self.drawn_points)):
+                if self.drawn_points[i - 1] and self.drawn_points[i]:
+                    cv2.line(frame, self.drawn_points[i - 1], self.drawn_points[i], self.brush_color, self.brush_size)
 
-            # Draw hand landmarks
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            cv2.imshow("Hand Drawing", frame)
 
-    # Draw the path
-    for i in range(1, len(drawn_points)):
-        if drawn_points[i - 1] is None or drawn_points[i] is None:
-            continue
-        cv2.line(frame, drawn_points[i - 1], drawn_points[i], (255, 0, 0), 3)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"): 
+                break
+            elif key == ord("c"):  
+                self.clear_canvas()
+            elif key == ord("s"):  
+                self.save_canvas(frame)
+            elif key == ord("1"):
+                self.brush_color = (255, 0, 0)  
+            elif key == ord("2"):
+                self.brush_color = (0, 255, 0)  
+            elif key == ord("3"):
+                self.brush_color = (0, 0, 255) 
+            elif key == ord("+"):
+                self.brush_size = min(10, self.brush_size + 1)
+            elif key == ord("-"):
+                self.brush_size = max(1, self.brush_size - 1)
 
-    # Show the video frame with the drawing
-    cv2.imshow('Hand Drawing', frame)
+        self.cap.release()
+        cv2.destroyAllWindows()
 
-    # Handle key presses
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):  # Quit the program
-        break
-    elif key == ord('c'):  # Clear the canvas
-        clear_canvas()
 
-cap.release()
-cv2.destroyAllWindows()
-
-# Save drawn points to a JSON file
-with open('drawing_data.json', 'w') as f:
-    json.dump(drawn_points, f)
+if __name__ == "__main__":
+    app = HandDrawingApp()
+    app.run()
